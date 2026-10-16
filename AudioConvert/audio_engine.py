@@ -5,10 +5,11 @@ audio_engine.py — Moteur de conversion de banques de sons vers WAV 48 kHz / 32
 Fonctionnalités :
   • Détection du vrai format via ffprobe (ignore les extensions fausses ou absentes)
   • Conversion → WAV pcm_f32le 48 kHz, nombre de pistes conservé
-  • Fusion des paires désentrelacées .L / .R en fichier stéréo (ou multicanal)
+  • Fusion des paires désentrelacées .L / .R (ou nom.L.ext / nom.R.ext) en stéréo
   • Renommage : suppression des accents, espaces et caractères non-standards
   • Réparation des fichiers corrompus : 7 stratégies de secours successives
   • Conversion des PCM bruts sans en-tête (anciens Sound Designer II, etc.)
+  • Conversions en parallèle, écriture atomique (pas de WAV partiel en cas d'échec)
 """
 
 import os, subprocess, json, unicodedata, re
@@ -22,6 +23,9 @@ from typing import Callable, Optional
 
 TARGET_CODEC = "pcm_f32le"   # WAV 32-bit IEEE float
 TARGET_RATE  = 48000          # Hz ; le nombre de canaux est toujours conservé
+
+# Nombre de conversions simultanées (ffmpeg PCM est surtout limité par le disque)
+DEFAULT_WORKERS = max(1, min(os.cpu_count() or 4, 8))
 
 # ── Extensions ignorées sans sonder ffprobe ───────────────────────────────────
 
@@ -55,15 +59,17 @@ REPAIR_STRATEGIES = [
 ]
 
 
+def _run(cmd: list) -> subprocess.CompletedProcess:
+    """subprocess.run sans stdin (évite qu'ffmpeg attende le clavier en parallèle)."""
+    return subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL)
+
+
 # ── Détection ────────────────────────────────────────────────────────────────
 
 def ffprobe_audio(fpath: Path) -> Optional[tuple]:
     """Retourne (codec, sample_rate, channels) ou None si le fichier n'est pas audio."""
-    r = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json",
-         "-show_streams", "-select_streams", "a:0", str(fpath)],
-        capture_output=True,
-    )
+    r = _run(["ffprobe", "-v", "quiet", "-print_format", "json",
+              "-show_streams", "-select_streams", "a:0", str(fpath)])
     if r.returncode != 0:
         return None
     try:
@@ -78,14 +84,18 @@ def ffprobe_audio(fpath: Path) -> Optional[tuple]:
 
 def is_raw_pcm_candidate(fpath: Path) -> bool:
     """Heuristique : le fichier pourrait être du PCM brut sans en-tête (ex. Sound Designer II)."""
-    if fpath.stat().st_size < 1024:
+    try:
+        if fpath.stat().st_size < 1024:
+            return False
+    except OSError:
         return False
-    r = subprocess.run(["file", str(fpath)], capture_output=True)
+    r = _run(["file", str(fpath)])
     out = r.stdout.decode("utf-8", errors="replace").lower()
     if not any(k in out for k in ("data", "common data format", "raw")):
         return False
     try:
-        sample = fpath.read_bytes()[:8192]
+        with open(fpath, "rb") as fh:          # ne lit que 8 Ko, pas tout le fichier
+            sample = fh.read(8192)
         return sample.count(0) / len(sample) < 0.9 if sample else False
     except OSError:
         return False
@@ -106,18 +116,30 @@ def _ffmpeg(dst: Path, inputs: list, extra: tuple = (), pre_global: list = ()) -
     pre_global : flags globaux avant les -i (ex. -err_detect ignore_err)
 
     Le nombre de canaux de la source est conservé (pas de -ac forcé).
+    Écriture dans un fichier temporaire puis renommage : un échec ou une
+    interruption ne laisse jamais de WAV partiel (qui serait ensuite « ignoré
+    car existant » au lancement suivant).
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["ffmpeg", "-y"] + list(pre_global)
+    tmp = dst.with_name(f".{dst.stem}.part.wav")
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+    cmd += list(pre_global)
     for flags, path in inputs:
-        cmd += flags + ["-i", str(path)]
-    cmd += list(extra) + ["-c:a", TARGET_CODEC, "-ar", str(TARGET_RATE), str(dst)]
-    r = subprocess.run(cmd, capture_output=True)
+        cmd += list(flags) + ["-i", str(path)]
+    cmd += list(extra) + ["-c:a", TARGET_CODEC, "-ar", str(TARGET_RATE), str(tmp)]
+    r = _run(cmd)
     # Vérifie aussi que le fichier de sortie n'est pas un WAV vide (> 100 octets)
-    return r.returncode == 0 and dst.exists() and dst.stat().st_size > 100
+    if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 100:
+        os.replace(tmp, dst)
+        return True
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    return False
 
 
-def repair_convert(src: Path, dst: Path) -> tuple[bool, Optional[str]]:
+def repair_convert(src: Path, dst: Path) -> tuple:
     """
     Essaie 7 stratégies de réparation successives.
     Retourne (succès, nom_de_la_stratégie_utilisée).
@@ -143,16 +165,18 @@ def sanitize_name(name: str) -> str:
     return re.sub(r"_+", "_", cleaned).strip("_") or "fichier"
 
 
-def natural_dst(src: Path, root: Path, out_root: Path, flatten: bool = False) -> Path:
+def natural_dst(src: Path, root: Path, out_root: Path, flatten: bool = False,
+                stem: Optional[str] = None) -> Path:
     """
     Chemin de destination avec nom nettoyé.
     flatten=False : arborescence conservée (comportement par défaut).
     flatten=True  : tous les fichiers dans out_root/, préfixés par leurs
                     dossiers parents pour éviter les collisions de noms.
+    stem          : nom de base imposé (utilisé pour les paires L/R).
     """
     rel   = src.relative_to(root)
     parts = list(rel.parts)
-    stem  = sanitize_name(Path(parts[-1]).stem)
+    stem  = sanitize_name(stem if stem is not None else Path(parts[-1]).stem)
     if flatten and len(parts) > 1:
         prefix = "_".join(sanitize_name(p) for p in parts[:-1])
         stem   = f"{prefix}_{stem}"
@@ -161,34 +185,57 @@ def natural_dst(src: Path, root: Path, out_root: Path, flatten: bool = False) ->
     return out_root / Path(*parts[:-1]) / (stem + ".wav")
 
 
-def resolve_dst(nat: Path, overwrite: bool, seen: set) -> Optional[Path]:
-    """Retourne le chemin de destination, ou None si le fichier doit être ignoré."""
-    if nat in seen:
-        return None
-    seen.add(nat)
-    return None if (nat.exists() and not overwrite) else nat
+def unique_dst(nat: Path, seen: set) -> Path:
+    """
+    Garantit un nom unique dans ce lot : kick.aif et kick.wav donneraient
+    tous deux kick.wav → le second devient kick_2.wav au lieu d'être ignoré.
+    Comparaison insensible à la casse (APFS/HFS+ le sont par défaut).
+    """
+    cand, n = nat, 2
+    while str(cand).lower() in seen:
+        cand = nat.with_name(f"{nat.stem}_{n}{nat.suffix}")
+        n += 1
+    seen.add(str(cand).lower())
+    return cand
+
+
+def _lr_side(f: Path) -> Optional[tuple]:
+    """
+    Reconnaît les mono désentrelacés :
+      nom.L / nom.R            (Sound Designer II, anciens Pro Tools)
+      nom.L.wav / nom.R.aif    (Pro Tools récents, multi-mono)
+    Retourne (clé_de_groupe, côté, nom_de_base) ou None.
+    """
+    ext = f.suffix.upper()
+    if ext in (".L", ".R"):
+        return (str(f.parent / f.stem).lower(), ext, f.stem)
+    inner = Path(f.stem).suffix.upper()
+    if inner in (".L", ".R") and ext:
+        base = Path(f.stem).stem
+        return (str(f.parent / base).lower() + "|" + ext.lower(), inner, base)
+    return None
 
 
 def group_lr_pairs(files: list) -> tuple:
     """
     Identifie les paires stéréo désentrelacées .L / .R (insensible à la casse).
-    Retourne (fichiers_normaux, [(gauche, droite)], orphelins).
+    Retourne (fichiers_normaux, [(gauche, droite, nom_de_base)], orphelins).
     """
-    by_stem: dict = {}
+    by_key: dict = {}
     for f in files:
-        ext = f.suffix.upper()
-        if ext in (".L", ".R"):
-            stem = f.parent / f.stem
-            by_stem.setdefault(stem, {})[ext] = f
+        side = _lr_side(f)
+        if side:
+            key, s, base = side
+            by_key.setdefault(key, {"base": base})[s] = f
 
     used, pairs, orphans = set(), [], []
-    for stem, sides in by_stem.items():
+    for sides in by_key.values():
+        base = sides.pop("base")
         if ".L" in sides and ".R" in sides:
-            pairs.append((sides[".L"], sides[".R"]))
-            used.update(sides.values())
+            pairs.append((sides[".L"], sides[".R"], base))
         else:
             orphans.extend(sides.values())
-            used.update(sides.values())
+        used.update(sides.values())
 
     return [f for f in files if f not in used], pairs, orphans
 
@@ -207,6 +254,7 @@ class Report:
     repaired:     int = 0   # fichiers récupérés via stratégie de réparation
     skipped:      int = 0
     errors:       int = 0
+    cancelled:   bool = False
     start_time: datetime = field(default_factory=datetime.now)
 
     def add(self, tag: str, msg: str):
@@ -216,8 +264,9 @@ class Report:
         elapsed = int((datetime.now() - self.start_time).total_seconds())
         total = (self.converted + self.merged + self.orphans + self.repaired
                  + self.raw_converted + self.raw_merged + self.raw_orphans)
+        head = "Annulé" if self.cancelled else "Terminé"
         parts = [
-            f"Terminé en {elapsed}s — {total} WAV 48 kHz / 32-bit float créés",
+            f"{head} en {elapsed}s — {total} WAV 48 kHz / 32-bit float créés",
             f"Standard  : {self.converted} conv / {self.merged} fusionnés L+R / {self.orphans} orphelins",
             f"PCM brut  : {self.raw_converted} conv / {self.raw_merged} fusionnés / {self.raw_orphans} orphelins",
         ]
@@ -227,65 +276,111 @@ class Report:
         return "\n".join(parts)
 
 
-# ── Contexte de traitement ────────────────────────────────────────────────────
+# ── Tâches de conversion ──────────────────────────────────────────────────────
+
+@dataclass
+class Job:
+    tag:     str                 # CONV, MERGE, ORPHAN, RAW, RAW_MERGE, RAW_ORPHAN
+    counter: str                 # attribut de Report à incrémenter en cas de succès
+    name:    str                 # nom affiché dans le journal
+    msg:     str                 # ligne du rapport (sans la destination)
+    dst:     Optional[Path]      # None → ignoré (existe déjà)
+    op:      Callable            # op(dst) -> bool
+    repair:  Optional[Callable] = None   # repair(dst) -> (bool, méthode)
+
 
 @dataclass
 class Ctx:
-    report:      Report
     root:        Path
     out_root:    Path
-    dry_run:     bool
     overwrite:   bool
-    try_repair:  bool
-    flatten:     bool        # True → tous les fichiers à plat dans out_root
-    cancel_flag: list        # [False] — mettre [True] pour annuler
-    progress_cb: Callable   # (tag: str, message: str) -> None
+    flatten:     bool
     seen: set = field(default_factory=set)
 
+    def dst(self, src: Path, stem: Optional[str] = None) -> Optional[Path]:
+        """Destination unique, ou None si elle existe déjà et qu'on n'écrase pas."""
+        d = unique_dst(natural_dst(src, self.root, self.out_root, self.flatten, stem),
+                       self.seen)
+        return None if (d.exists() and not self.overwrite) else d
 
-def _apply(
-    ctx: Ctx,
-    nat: Path,
-    tag: str,
-    make_msg,
-    op,
-    repair_op=None,
-) -> str:
+
+def build_audio_jobs(ctx: Ctx, audio_files: list, try_repair: bool) -> list:
+    regular, pairs, orphans = group_lr_pairs(audio_files)
+    jobs = []
+    for s in regular:
+        jobs.append(Job(
+            "CONV", "converted", s.name, s.name, ctx.dst(s),
+            lambda d, s=s: _ffmpeg(d, [([], s)]),
+            (lambda d, s=s: repair_convert(s, d)) if try_repair else None,
+        ))
+    for l, r, base in pairs:
+        jobs.append(Job(
+            "MERGE", "merged", base, f"{l.name} + {r.name}", ctx.dst(l, base),
+            lambda d, l=l, r=r: _ffmpeg(d, [([], l), ([], r)], STEREO_MERGE),
+        ))
+    for s in orphans:
+        jobs.append(Job(
+            "ORPHAN", "orphans", s.name, f"{s.name} (orphelin)", ctx.dst(s),
+            lambda d, s=s: _ffmpeg(d, [([], s)]),
+            (lambda d, s=s: repair_convert(s, d)) if try_repair else None,
+        ))
+    return jobs
+
+
+def build_raw_jobs(ctx: Ctx, raw_files: list, rate: int, bits: int, le: bool) -> list:
+    fmt = pcm_ffmpeg_fmt(bits, le)
+    pre = ["-f", fmt, "-ar", str(rate), "-ac", "1"]
+    regular, pairs, orphans = group_lr_pairs(raw_files)
+    jobs = []
+    for s in regular:
+        jobs.append(Job(
+            "RAW", "raw_converted", s.name, f"{s.name} (PCM brut)", ctx.dst(s),
+            lambda d, s=s: _ffmpeg(d, [(pre, s)]),
+        ))
+    for l, r, base in pairs:
+        jobs.append(Job(
+            "RAW_MERGE", "raw_merged", base, f"{l.name} + {r.name} (PCM brut stéréo)",
+            ctx.dst(l, base),
+            lambda d, l=l, r=r: _ffmpeg(d, [(pre, l), (pre, r)], STEREO_MERGE),
+        ))
+    for s in orphans:
+        jobs.append(Job(
+            "RAW_ORPHAN", "raw_orphans", s.name, f"{s.name} (PCM brut, orphelin)",
+            ctx.dst(s),
+            lambda d, s=s: _ffmpeg(d, [(pre, s)]),
+        ))
+    return jobs
+
+
+def _run_job(job: Job, dry_run: bool, cancel_flag: list, progress_cb: Callable) -> tuple:
     """
-    Résout la destination, loggue et exécute l'opération.
-    Si op() échoue et ctx.try_repair est True, tente repair_op().
-    Retourne : 'ok' | 'repaired' | 'skip' | 'error' | 'cancel'
+    Exécute une tâche (dans un thread du pool).
+    Retourne (statut, lignes_de_rapport) ; statut : ok | repaired | skip | error | cancel
     """
-    if ctx.cancel_flag[0]:
-        return "cancel"
+    if cancel_flag[0]:
+        return "cancel", []
+    try:
+        if job.dst is None:
+            progress_cb("SKIP", f"{job.name} — déjà converti")
+            return "skip", [f"[SKIP] {job.name} — déjà converti"]
 
-    dst = resolve_dst(nat, ctx.overwrite, ctx.seen)
-    if dst is None:
-        ctx.report.skipped += 1
-        ctx.progress_cb("SKIP", nat.name)
-        return "skip"
+        lines = [f"[{job.tag}] {job.msg} → {job.dst.name}"]
+        progress_cb(job.tag, job.name)
+        if dry_run or job.op(job.dst):
+            return "ok", lines
 
-    ctx.report.add(tag, make_msg(dst))
-    ctx.progress_cb(tag, nat.name)
+        if job.repair:
+            ok, method = job.repair(job.dst)
+            if ok:
+                lines.append(f"[REPAIRED] Réparé ({method}) : {job.name}")
+                progress_cb("REPAIRED", f"{job.name} ({method})")
+                return "repaired", lines
 
-    if ctx.dry_run:
-        return "ok"
-
-    if op(dst):
-        return "ok"
-
-    # Tentative de réparation
-    if ctx.try_repair and repair_op:
-        ok, method = repair_op(dst)
-        if ok:
-            ctx.report.add("REPAIRED", f"Réparé ({method}) : {nat.name}")
-            ctx.progress_cb("REPAIRED", nat.name)
-            return "repaired"
-
-    ctx.report.add("ERROR", f"Échec : {nat.name}")
-    ctx.report.errors += 1
-    ctx.progress_cb("ERROR", nat.name)
-    return "error"
+        lines.append(f"[ERROR] Échec : {job.name}")
+        progress_cb("ERROR", job.name)
+        return "error", lines
+    finally:
+        progress_cb("__STEP__", "")
 
 
 # ── Scan parallèle ────────────────────────────────────────────────────────────
@@ -302,10 +397,15 @@ def _probe_one(fpath: Path):
     return fpath, "skip", "non-audio"
 
 
-def scan_files(root: Path, progress_cb: Callable) -> tuple:
+def scan_files(root: Path, progress_cb: Callable, exclude: Optional[Path] = None) -> tuple:
+    exclude = exclude.resolve() if exclude else None
     all_files = []
     for dp, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        # Ignore les dossiers cachés et le dossier de sortie s'il est dans la source
+        dirs[:] = sorted(
+            d for d in dirs
+            if not d.startswith(".") and (Path(dp, d).resolve() != exclude)
+        )
         for f in sorted(files):
             if not f.startswith("."):
                 all_files.append(Path(dp) / f)
@@ -326,96 +426,6 @@ def scan_files(root: Path, progress_cb: Callable) -> tuple:
     return audio, raw, skip_list, probe_cache
 
 
-# ── Traitement audio standard ─────────────────────────────────────────────────
-
-def process_audio(ctx: Ctx, audio_files: list, probe_cache: dict):
-    regular, pairs, orphans = group_lr_pairs(audio_files)
-
-    for src in regular:
-        if ctx.cancel_flag[0]:
-            break
-        nat = natural_dst(src, ctx.root, ctx.out_root, ctx.flatten)
-        r = _apply(
-            ctx, nat, "CONV",
-            lambda d, s=src: f"{s.name} → {d.name}",
-            lambda d, s=src: _ffmpeg(d, [([], s)]),
-            repair_op=lambda d, s=src: repair_convert(s, d),
-        )
-        if r == "ok":       ctx.report.converted += 1
-        elif r == "repaired": ctx.report.repaired += 1
-
-    for left, right in pairs:
-        if ctx.cancel_flag[0]:
-            break
-        nat = natural_dst(left, ctx.root, ctx.out_root, ctx.flatten)
-        r = _apply(
-            ctx, nat, "MERGE",
-            lambda d, l=left, ri=right: f"{l.name} + {ri.name} → {d.name}",
-            lambda d, l=left, ri=right: _ffmpeg(d, [([], l), ([], ri)], STEREO_MERGE),
-        )
-        if r in ("ok", "repaired"):
-            ctx.report.merged += 1
-
-    for src in orphans:
-        if ctx.cancel_flag[0]:
-            break
-        nat = natural_dst(src, ctx.root, ctx.out_root, ctx.flatten)
-        r = _apply(
-            ctx, nat, "ORPHAN",
-            lambda d, s=src: f"{s.name} (orphelin) → {d.name}",
-            lambda d, s=src: _ffmpeg(d, [([], s)]),
-            repair_op=lambda d, s=src: repair_convert(s, d),
-        )
-        if r in ("ok", "repaired"):
-            ctx.report.orphans += 1
-
-
-# ── Traitement PCM brut ───────────────────────────────────────────────────────
-
-def process_raw_pcm(ctx: Ctx, raw_files: list, rate: int, bits: int, le: bool):
-    fmt = pcm_ffmpeg_fmt(bits, le)
-
-    def pre(ch): return ["-f", fmt, "-ar", str(rate), "-ac", str(ch)]
-
-    regular, pairs, orphans = group_lr_pairs(raw_files)
-
-    for src in regular:
-        if ctx.cancel_flag[0]:
-            break
-        nat = natural_dst(src, ctx.root, ctx.out_root, ctx.flatten)
-        r = _apply(
-            ctx, nat, "RAW",
-            lambda d, s=src: f"{s.name} (PCM brut) → {d.name}",
-            lambda d, s=src: _ffmpeg(d, [(pre(1), s)]),
-        )
-        if r in ("ok", "repaired"):
-            ctx.report.raw_converted += 1
-
-    for left, right in pairs:
-        if ctx.cancel_flag[0]:
-            break
-        nat = natural_dst(left, ctx.root, ctx.out_root, ctx.flatten)
-        r = _apply(
-            ctx, nat, "RAW_MERGE",
-            lambda d, l=left, ri=right: f"{l.name} + {ri.name} (PCM brut stéréo) → {d.name}",
-            lambda d, l=left, ri=right: _ffmpeg(d, [(pre(1), l), (pre(1), ri)], STEREO_MERGE),
-        )
-        if r in ("ok", "repaired"):
-            ctx.report.raw_merged += 1
-
-    for src in orphans:
-        if ctx.cancel_flag[0]:
-            break
-        nat = natural_dst(src, ctx.root, ctx.out_root, ctx.flatten)
-        r = _apply(
-            ctx, nat, "RAW_ORPHAN",
-            lambda d, s=src: f"{s.name} (PCM brut, orphelin) → {d.name}",
-            lambda d, s=src: _ffmpeg(d, [(pre(1), s)]),
-        )
-        if r in ("ok", "repaired"):
-            ctx.report.raw_orphans += 1
-
-
 # ── Point d'entrée ────────────────────────────────────────────────────────────
 
 def run_conversion(
@@ -431,39 +441,46 @@ def run_conversion(
     le: bool,
     cancel_flag: list,
     progress_cb: Callable,
+    workers: int = DEFAULT_WORKERS,
 ) -> Report:
     """
     Appeler depuis un thread secondaire.
-    progress_cb(tag, message) est appelé depuis ce thread.
+    progress_cb(tag, message) est appelé depuis les threads de travail.
+    Un événement ("__STEP__", "") est émis après chaque tâche terminée.
     """
     report = Report()
-    ctx = Ctx(
-        report=report,
-        root=root,
-        out_root=out_root,
-        dry_run=dry_run,
-        overwrite=overwrite,
-        try_repair=try_repair,
-        flatten=flatten,
-        cancel_flag=cancel_flag,
-        progress_cb=progress_cb,
-    )
+    ctx = Ctx(root=root, out_root=out_root, overwrite=overwrite, flatten=flatten)
 
-    audio, raw, skip_list, probe_cache = scan_files(root, progress_cb)
+    audio, raw, skip_list, _ = scan_files(root, progress_cb, exclude=out_root)
 
     for fpath, reason in skip_list:
         report.add("SKIP", f"{fpath.name} — {reason}")
         report.skipped += 1
 
-    progress_cb("__TOTAL__", str(len(audio) + len(raw)))
+    jobs = build_audio_jobs(ctx, audio, try_repair)
+    if not skip_raw:
+        jobs += build_raw_jobs(ctx, raw, rate, bits, le)
+
+    progress_cb("__TOTAL__", str(len(jobs)))
     progress_cb("INFO", (
         f"Trouvé : {len(audio)} audio, {len(raw)} PCM brut, "
-        f"{len(skip_list)} ignorés"
+        f"{len(skip_list)} ignorés — {len(jobs)} WAV à produire "
+        f"({workers} en parallèle)"
     ))
 
-    process_audio(ctx, audio, probe_cache)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        results = ex.map(lambda j: _run_job(j, dry_run, cancel_flag, progress_cb), jobs)
+        # ex.map rend les résultats dans l'ordre des tâches → rapport stable
+        for job, (status, lines) in zip(jobs, results):
+            report.lines.extend(lines)
+            if status == "ok":
+                setattr(report, job.counter, getattr(report, job.counter) + 1)
+            elif status == "repaired":
+                report.repaired += 1
+            elif status == "skip":
+                report.skipped += 1
+            elif status == "error":
+                report.errors += 1
 
-    if not skip_raw and not cancel_flag[0]:
-        process_raw_pcm(ctx, raw, rate, bits, le)
-
+    report.cancelled = bool(cancel_flag[0])
     return report

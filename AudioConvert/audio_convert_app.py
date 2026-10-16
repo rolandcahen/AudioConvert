@@ -10,7 +10,7 @@ import threading
 import queue
 import sys
 import os
-import subprocess
+import shutil
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -63,13 +63,12 @@ class AudioConvertApp(_BaseApp):
     # ── Vérification de ffmpeg / ffprobe ─────────────────────────────────────
 
     def _check_deps(self):
-        missing = [t for t in ("ffmpeg", "ffprobe")
-                   if subprocess.run(["which", t], capture_output=True).returncode != 0]
+        missing = [t for t in ("ffmpeg", "ffprobe") if shutil.which(t) is None]
         if missing:
             messagebox.showerror(
                 "Dépendances manquantes",
                 f"Outil(s) manquant(s) : {', '.join(missing)}\n\n"
-                "Installez-les avec Homebrew :\n"
+                "Lancez ./install.sh, ou installez-les avec Homebrew :\n"
                 "  brew install ffmpeg\n\n"
                 "Si Homebrew n'est pas installé : https://brew.sh",
             )
@@ -283,6 +282,19 @@ class AudioConvertApp(_BaseApp):
             messagebox.showwarning("Dossier de sortie",
                                    "Veuillez indiquer un dossier de sortie.")
             return
+        if Path(out).resolve() == Path(src).resolve():
+            messagebox.showwarning("Dossier de sortie",
+                                   "Le dossier de sortie doit être différent du dossier source.")
+            return
+        try:
+            rate = int(self._rate_var.get())
+            bits = int(self._bits_var.get())
+            if rate <= 0 or bits not in (8, 16, 24, 32):
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Paramètres PCM brut",
+                                   "Fréquence ou nombre de bits invalide.")
+            return
 
         self._cancel_flag[0] = False
         self._total = self._processed = 0
@@ -305,8 +317,8 @@ class AudioConvertApp(_BaseApp):
                 skip_raw=self._skip_raw_var.get(),
                 try_repair=self._repair_var.get(),
                 flatten=self._flatten_var.get(),
-                rate=int(self._rate_var.get()),
-                bits=int(self._bits_var.get()),
+                rate=rate,
+                bits=bits,
                 le=self._le_var.get(),
                 cancel_flag=self._cancel_flag,
                 progress_cb=self._on_progress,
@@ -349,15 +361,16 @@ class AudioConvertApp(_BaseApp):
                     self._progress_bar.stop()
                     self._progress_bar.configure(mode="determinate")
                     self._progress_var.set(0)
+                elif tag == "__STEP__":
+                    # Une tâche terminée (conversion, fusion, ignorée ou échec)
+                    self._processed += 1
+                    if self._total > 0:
+                        pct = min(100.0, self._processed * 100 / self._total)
+                        self._progress_var.set(pct)
+                        self._status_var.set(
+                            f"Traitement  {self._processed} / {self._total} fichiers")
                 else:
                     self._log_line(tag, data)
-                    if tag not in ("SCAN", "INFO", "SKIP", "SKIP_EXISTING"):
-                        self._processed += 1
-                        if self._total > 0:
-                            pct = min(100.0, self._processed * 100 / self._total)
-                            self._progress_var.set(pct)
-                            self._status_var.set(
-                                f"Traitement  {self._processed} / {self._total} fichiers")
         except queue.Empty:
             pass
         self.after(40, self._poll_queue)
